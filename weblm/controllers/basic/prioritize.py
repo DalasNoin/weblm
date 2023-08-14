@@ -8,6 +8,8 @@ import json
 
 from weblm.controllers.basic.utils import construct_state, choose
 
+MODEL = "command-medium-nightly"
+
 prioritization_template = """$examples
 ---
 Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
@@ -45,9 +47,9 @@ def gather_prioritisation_examples(co: cohere.Client, state: str, topk: int = 6,
             if all(x in h for x in ["objective", "command", "url", "elements"]):
                 # make sure the element relevant to the next command is included
                 elements = list(filter(lambda x: x[:4] != "text", h["elements"]))
-                command_element = " ".join(h["command"].split()[1:3])
-                command_element = list(filter(lambda x: command_element in x, elements))
-                assert len(command_element) == 1, f"length is {len(command_element)}"
+                command_element = h["command"].split()[2]
+                command_element = list(filter(lambda x: command_element in x.split(" "), elements))
+                assert len(command_element) == 1, f"length is {len(command_element)}, relevant entry: {h}"
                 command_element = command_element[0]
 
                 if not command_element in elements[:num_elements]:
@@ -75,9 +77,12 @@ def generate_prioritization(co: cohere.Client, objective: str, page_elements: Li
     prioritization = prioritization.replace("$objective", objective)
     prioritization = prioritization.replace("$url", url)
 
-    print(prioritization)
-
-    prioritized_elements = choose(co, prioritization, [{"element": x} for x in page_elements], topk=len(page_elements))
+    prioritized_elements = choose(co,
+                                  prioritization, [{
+                                      "element": x
+                                  } for x in page_elements],
+                                  topk=len(page_elements),
+                                  model=MODEL)
     prioritized_elements = [x[1]["element"] for x in prioritized_elements]
 
     return prioritized_elements

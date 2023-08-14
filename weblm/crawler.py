@@ -4,7 +4,9 @@ import re
 import time
 from os.path import exists
 from sys import platform
+from pdb import set_trace as bp
 
+import playwright
 from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
 
@@ -25,6 +27,7 @@ black_listed_elements = set([
 
 URL_PATTERN = r"https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)"
 WINDOW_SIZE = {"width": 1280, "height": 1080}
+USER_DATA_DIR = ".browser_data/"
 
 
 def replace_special_fields(cmd):
@@ -41,8 +44,9 @@ def replace_special_fields(cmd):
 class Crawler:
 
     def __init__(self):
-        self.browser = sync_playwright().start().chromium.launch(headless=False,)
-        self.context = self.browser.new_context(
+        self.context = sync_playwright().start().chromium.launch_persistent_context(
+            USER_DATA_DIR,
+            headless=False,
             user_agent=
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36"
         )
@@ -114,6 +118,7 @@ class Crawler:
                 "includePaintOrder": True
             },
         )
+        strings = tree["strings"]
         device_pixel_ratio = page.evaluate("window.devicePixelRatio")
         win_scroll_x = page.evaluate("window.scrollX")
         win_scroll_y = page.evaluate("window.scrollY")
@@ -121,13 +126,48 @@ class Crawler:
         win_left_bound = page.evaluate("window.pageXOffset")
         win_width = page.evaluate("window.screen.width")
         win_height = page.evaluate("window.screen.height")
-        elements_of_interest = self._crawl(tree, win_upper_bound, win_width, win_left_bound, win_height,
-                                           device_pixel_ratio)
+        elements_of_interest = []
+        id_counter = 0
+        for i in range(len(tree["documents"])):
+            try:
+                document = tree["documents"][i]
+                document_url = strings[document["documentURL"]]
+                frame = self.page.frame(url=document_url)
+                if frame is None:
+                    offset = (0, 0)
+                else:
+                    bounding_box = frame.frame_element().bounding_box()
+                    if bounding_box is None:
+                        offset = (0, 0)
+                    else:
+                        offset = (bounding_box["x"], bounding_box["y"])
+            except playwright._impl._api_types.Error:
+                offset = (0, 0)
+
+            id_counter, new_elements = self._crawl(tree,
+                                                   win_upper_bound,
+                                                   win_width,
+                                                   win_left_bound,
+                                                   win_height,
+                                                   device_pixel_ratio,
+                                                   document_index=i,
+                                                   id_counter=id_counter,
+                                                   offset=offset)
+            elements_of_interest += new_elements
 
         print("Parsing time: {:0.2f} seconds".format(time.time() - start))
         return elements_of_interest
 
-    def _crawl(self, tree, win_upper_bound, win_width, win_left_bound, win_height, device_pixel_ratio):
+    def _crawl(self,
+               tree,
+               win_upper_bound,
+               win_width,
+               win_left_bound,
+               win_height,
+               device_pixel_ratio,
+               document_index=0,
+               id_counter=0,
+               offset=(0, 0)):
         page_element_buffer = self.page_element_buffer
 
         page_state_as_text = []
@@ -152,7 +192,7 @@ class Crawler:
         })
 
         strings = tree["strings"]
-        document = tree["documents"][0]
+        document = tree["documents"][document_index]
         nodes = document["nodes"]
         backend_node_id = nodes["backendNodeId"]
         attributes = nodes["attributes"]
@@ -210,6 +250,14 @@ class Crawler:
 
             return values
 
+        def find_node_with_id(id):
+            for node_id in range(len(attributes)):
+                element_attributes = find_attributes(attributes[node_id], ["id"])
+                if element_attributes.get("id") == id:
+                    return node_id
+
+            return None
+
         def add_to_hash_tree(hash_tree, tag, node_id, node_name, parent_id):
             parent_id_str = str(parent_id)
             if not parent_id_str in hash_tree:
@@ -237,9 +285,46 @@ class Crawler:
 
             return value
 
+        def check_labelled_by(hash_tree, node_id, parent_id):
+            if str(node_id) in hash_tree:
+                return hash_tree[str(node_id)]
+
+            parent_id_str = str(parent_id)
+            if not parent_id_str in hash_tree:
+                grand_parent_id = parent[parent_id]
+                check_labelled_by(hash_tree, parent_id, grand_parent_id)
+
+            is_parent_desc_anchor, anchor_id = hash_tree[parent_id_str]
+
+            element_attributes = find_attributes(attributes[node_id], ["aria-labelledby", "class"])
+            labelled_by = element_attributes.get("aria-labelledby")
+
+            # even if the anchor is nested in another anchor, we set the "root" for all descendants to be ::Self
+            if labelled_by:
+                value = (True, node_id)
+                hash_tree[str(node_id)] = value
+                label_node = find_node_with_id(labelled_by)
+
+                if label_node is None:
+                    value = (False, None)
+                else:
+                    check_labelled_by(hash_tree, label_node, node_id)
+            elif is_parent_desc_anchor:  # reuse the parent's anchor_id (which could be much higher in the tree)
+                value = (True, anchor_id)
+            else:
+                value = (
+                    False,
+                    None,
+                )  # not a descendant of an anchor, most likely it will become text, an interactive element or discarded
+
+            hash_tree[str(node_id)] = value
+
+            return value
+
         anchor_ancestry = {"-1": (False, None)}
         button_ancestry = {"-1": (False, None)}
         select_ancestry = {"-1": (False, None)}
+        label_ancestry = {"-1": (False, None)}
 
         for index, node_name_index in enumerate(node_names):
             node_parent = parent[index]
@@ -252,6 +337,7 @@ class Crawler:
 
             is_ancestor_of_select, select_id = add_to_hash_tree(select_ancestry, ["select"], index, node_name,
                                                                 node_parent)
+            is_ancestor_of_labelled, label_id = check_labelled_by(label_ancestry, index, node_parent)
 
             try:
                 cursor = layout_node_index.index(select_id) if is_ancestor_of_select else layout_node_index.index(index)
@@ -268,6 +354,8 @@ class Crawler:
             [x, y, width, height] = bounds[cursor]
             x /= device_pixel_ratio
             y /= device_pixel_ratio
+            x += offset[0]
+            y += offset[1]
             width /= device_pixel_ratio
             height /= device_pixel_ratio
 
@@ -291,7 +379,7 @@ class Crawler:
                 "aria-labelledby", "aria-description", "aria-describedby"
             ])
 
-            ancestor_exception = is_ancestor_of_anchor or is_ancestor_of_button or is_ancestor_of_select
+            ancestor_exception = is_ancestor_of_anchor or is_ancestor_of_button or is_ancestor_of_select or is_ancestor_of_labelled
             ancestor_node_key = None
             if ancestor_exception:
                 if is_ancestor_of_anchor:
@@ -300,6 +388,8 @@ class Crawler:
                     ancestor_node_key = str(button_id)
                 elif is_ancestor_of_select:
                     ancestor_node_key = str(select_id)
+                elif is_ancestor_of_labelled:
+                    ancestor_node_key = str(label_id)
             ancestor_node = (None if not ancestor_exception else child_nodes.setdefault(str(ancestor_node_key), []))
 
             if node_name == "#text" and ancestor_exception:
@@ -354,7 +444,6 @@ class Crawler:
 
         # lets filter further to remove anything that does not hold any text nor has click handlers + merge text from leaf#text nodes with the parent
         elements_of_interest = []
-        id_counter = 0
 
         for element in elements_in_view_port:
             node_index = element.get("node_index")
@@ -416,7 +505,7 @@ class Crawler:
                 pass
             id_counter += 1
 
-        return elements_of_interest
+        return id_counter, elements_of_interest
 
     def run_cmd(self, cmd):
         print("cmd", cmd)

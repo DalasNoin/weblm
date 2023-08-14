@@ -17,10 +17,11 @@ from .controllers import registry
 from .crawler import URL_PATTERN, Crawler
 from .utils import Prompt, Command
 
+# cohere.COHERE_API_URL = 'https://stg.api.cohere.ai'
 co = cohere.Client(os.environ.get("COHERE_KEY"), check_api_key=False)
 
 
-def reset(controller):
+def reset(controller, unguided):
     _crawler = Crawler()
 
     def print_help():
@@ -33,12 +34,12 @@ def reset(controller):
     if len(i) > 0:
         objective = i
 
-    _controller = registry.get(controller)(co, objective)
+    _controller = registry.get(controller)(co, objective, prompt_user=not unguided)
     return _crawler, _controller
 
 
-def main(controller="basic"):
-    crawler, controller = reset(controller)
+def main(controller="basic", unguided=False):
+    crawler, controller = reset(controller, unguided)
 
     response = None
     content = []
